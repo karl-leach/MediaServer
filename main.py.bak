@@ -1,0 +1,110 @@
+from flask import Flask, request, jsonify
+import os
+import threading
+import ffmpeg
+import subprocess
+
+app = Flask(__name__)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MEDIA_FOLDER = os.path.join(BASE_DIR, "media")
+OUTPUT_FOLDER = os.path.join(BASE_DIR, "tmp")
+transcoding_processes = {}  # To store process references for cancellation
+
+def transcode_to_hls_with_cancellation(file_path, resolution, bitrate, output_file, process_key):
+    try:
+        # Construct FFmpeg command using ffmpeg-python
+        command = ffmpeg.input(file_path).output(
+            output_file,
+            vf=f'format=yuv420p,scale={resolution}',
+            **{'c:v': 'hevc_nvenc'},  # NVIDIA encoder
+            **{'b:v': bitrate},  # Video bitrate
+            preset='fast',
+            **{'c:a': 'aac'},  # Audio codec
+            **{'b:a': '128k'},  # Audio bitrate
+            ar='48000',
+            channel_layout='stereo',
+            hls_time=3,
+            hls_playlist_type='event',
+            hls_flags='append_list+delete_segments',
+        ).compile()  # Generates the FFmpeg command as a list
+
+        # Spawn subprocess with the generated FFmpeg command
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        transcoding_processes[process_key] = process
+
+        # Wait for the process to finish
+        process.communicate()
+        print(f"Transcoding complete: {output_file}")
+
+        # Remove process from registry when finished
+        transcoding_processes.pop(process_key, None)
+    except Exception as e:
+        print(f"Error during transcoding: {e}")
+        transcoding_processes.pop(process_key, None)
+
+
+@app.route('/transcode', methods=['POST'])
+def transcode_media():
+    """
+    API endpoint to start transcoding.
+    """
+    try:
+        data = request.json
+        file_name = data.get("file_name")
+        resolution = data.get("resolution")
+        bitrate = data.get("bitrate")
+
+        if not file_name or not resolution or not bitrate:
+            return jsonify({"error": "Missing parameters"}), 400
+
+        file_path = os.path.join(MEDIA_FOLDER, file_name)
+
+        if not os.path.exists(file_path):
+            return jsonify({"error": "File not found"}), 404
+
+        output_file = os.path.join(OUTPUT_FOLDER, f"{os.path.splitext(file_name)[0]}_hls.m3u8")
+        process_key = file_name  # Use the file name as the key for the process
+
+        # Start transcoding in a new thread
+        transcoding_thread = threading.Thread(
+            target=transcode_to_hls_with_cancellation,
+            args=(file_path, resolution, bitrate, output_file, process_key)
+        )
+        transcoding_thread.start()
+
+        return jsonify({"message": "Transcoding started", "process_key": process_key, "output_file": output_file})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/cancel-transcode', methods=['POST'])
+def cancel_transcoding():
+    """
+    API endpoint to cancel an ongoing transcoding process.
+    """
+    try:
+        data = request.json
+        process_key = data.get("process_key")
+
+        if not process_key:
+            return jsonify({"error": "Missing process_key parameter"}), 400
+
+        # Check if process exists
+        process = transcoding_processes.get(process_key)
+        if not process:
+            return jsonify({"error": "No such transcoding process"}), 404
+
+        # Terminate the process
+        process.terminate()
+        transcoding_processes.pop(process_key, None)
+        return jsonify({"message": f"Transcoding process '{process_key}' cancelled."})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == '__main__':
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    app.run(debug=True)
